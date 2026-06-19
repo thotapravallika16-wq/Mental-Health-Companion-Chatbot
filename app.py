@@ -1,8 +1,12 @@
 import os
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-import requests
+try:
+    import requests
+except ImportError:  # requests is optional when API integration is not used
+    requests = None
+
 from flask import Flask, jsonify, request
 
 app = Flask(__name__, static_folder='.', static_url_path='')
@@ -115,6 +119,34 @@ Guidelines:
 - End messages with a question to keep the conversation going"""
 
 
+def call_anthropic_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = 'https://api.anthropic.com/v1/messages'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {ANTHROPIC_API_KEY}',
+    }
+
+    if requests is not None:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        return response.json()
+
+    from urllib import request as urllib_request
+    from urllib.error import HTTPError, URLError
+
+    request_body = json.dumps(payload).encode('utf-8')
+    req = urllib_request.Request(url, data=request_body, headers=headers, method='POST')
+
+    try:
+        with urllib_request.urlopen(req, timeout=15) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        error_body = exc.read().decode('utf-8', errors='ignore')
+        raise RuntimeError(f'HTTP error {exc.code}: {error_body}') from exc
+    except URLError as exc:
+        raise RuntimeError(f'Connection error: {exc.reason}') from exc
+
+
 @app.route('/')
 def index() -> Any:
     return app.send_static_file('mental_health_companion.html')
@@ -134,26 +166,31 @@ def chat() -> Any:
 
     if ANTHROPIC_API_KEY:
         system_prompt = build_system_prompt(sentiment)
+        payload = {
+            'model': AI_AGENT_MODEL,
+            'max_tokens': 1000,
+            'system': system_prompt,
+            'messages': history,
+        }
         try:
-            response = requests.post(
-                'https://api.anthropic.com/v1/messages',
-                headers={
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {ANTHROPIC_API_KEY}',
-                },
-                json={
-                    'model': AI_AGENT_MODEL,
-                    'max_tokens': 1000,
-                    'system': system_prompt,
-                    'messages': history,
-                },
-                timeout=15,
-            )
-            response.raise_for_status()
-            data = response.json()
-            reply = data.get('content', [{}])[0].get('text') or data.get('completion', {}).get('content', [{}])[0].get('text') or data.get('completion') or reply
+            data = call_anthropic_api(payload)
+            content = data.get('content')
+            if isinstance(content, list) and content:
+                reply = content[0].get('text') or reply
+            elif isinstance(content, dict):
+                reply = content.get('text') or reply
+
+            completion = data.get('completion')
+            if isinstance(completion, dict):
+                completion_content = completion.get('content')
+                if isinstance(completion_content, list) and completion_content:
+                    reply = completion_content[0].get('text') or reply
+                elif isinstance(completion_content, dict):
+                    reply = completion_content.get('text') or reply
+            elif isinstance(completion, str) and completion:
+                reply = completion
         except Exception:
-            reply = reply
+            pass
 
     return jsonify({
         'reply': reply,
@@ -162,4 +199,5 @@ def chat() -> Any:
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
